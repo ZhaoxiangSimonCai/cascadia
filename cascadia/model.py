@@ -1,9 +1,13 @@
 from .depthcharge.encoders import PeakEncoder, FloatEncoder
-from .depthcharge.transformers import SpectrumTransformerEncoder, PeptideTransformerDecoder
+from .depthcharge.transformers import (
+    SpectrumTransformerEncoder,
+    PeptideTransformerDecoder,
+)
 from typing import Any, Dict, Iterable, List, Tuple
 import torch
 import numpy as np
 import pytorch_lightning as pl
+
 
 class AugmentedPeakEncoder(torch.nn.Module):
     """Encode an augmented m/z, intensity,
@@ -30,7 +34,7 @@ class AugmentedPeakEncoder(torch.nn.Module):
         min_intensity_wavelength: float = 1e-6,
         max_intensity_wavelength: float = 1,
         min_rt_wavelength: float = 1e-6,
-        max_rt_wavelength: float = 10
+        max_rt_wavelength: float = 10,
     ) -> None:
         """Initialize the MzEncoder."""
         super().__init__()
@@ -40,13 +44,11 @@ class AugmentedPeakEncoder(torch.nn.Module):
             d_model,
             min_intensity_wavelength,
             max_intensity_wavelength,
-            learnable_wavelengths = False
+            learnable_wavelengths=False,
         )
 
         self.rt_encoder = FloatEncoder(
-            d_model,
-            min_wavelength=min_rt_wavelength,
-            max_wavelength=max_rt_wavelength
+            d_model, min_wavelength=min_rt_wavelength, max_wavelength=max_rt_wavelength
         )
 
         self.level_encoder = torch.nn.Embedding(3, d_model)
@@ -77,35 +79,36 @@ class AugmentedPeakEncoder(torch.nn.Module):
             [
                 self.peak_encoder(X),
                 self.rt_encoder(X[:, :, 2]),
-                self.level_encoder(X[:, :, 3].int())
+                self.level_encoder(X[:, :, 3].int()),
             ],
             dim=2,
         )
 
         return self.combiner(encoded)
 
+
 class AugmentedSpec2Pep(pl.LightningModule):
     def __init__(
-            self,
-            d_model,
-            n_layers,
-            rt_width,
-            n_head,
-            dropout,
-            dim_feedforward,
-            tokenizer,
-            max_charge,
-            lr = 1e-4,
-            frag_weight = 20,
-            lr_decay=1e-9, 
-            alpha = 1e-3
-        ):
+        self,
+        d_model,
+        n_layers,
+        rt_width,
+        n_head,
+        dropout,
+        dim_feedforward,
+        tokenizer,
+        max_charge,
+        lr=1e-4,
+        frag_weight=20,
+        lr_decay=1e-9,
+        alpha=1e-3,
+        return_embeddings: bool = False,
+    ):
 
         super().__init__()
 
         self.peak_encoder = AugmentedPeakEncoder(
-            d_model=d_model,
-            max_rt_wavelength=2*rt_width
+            d_model=d_model, max_rt_wavelength=2 * rt_width
         )
 
         self.spectrum_encoder = SpectrumTransformerEncoder(
@@ -114,7 +117,7 @@ class AugmentedSpec2Pep(pl.LightningModule):
             n_layers=n_layers,
             dropout=dropout,
             dim_feedforward=dim_feedforward,
-            peak_encoder=self.peak_encoder
+            peak_encoder=self.peak_encoder,
         )
 
         self.decoder = PeptideTransformerDecoder(
@@ -124,19 +127,86 @@ class AugmentedSpec2Pep(pl.LightningModule):
             n_layers=n_layers,
             dropout=dropout,
             n_tokens=tokenizer,
-            max_charge=max_charge
+            max_charge=max_charge,
         )
 
-        self.prec_layer = torch.nn.Linear(d_model,1)
-        self.frag_layer = torch.nn.Linear(d_model,2)
+        self.prec_layer = torch.nn.Linear(d_model, 1)
+        self.frag_layer = torch.nn.Linear(d_model, 2)
 
         self.CELoss = torch.nn.CrossEntropyLoss(ignore_index=0)
-        self.fragCELoss = torch.nn.CrossEntropyLoss(weight=torch.tensor([1.,frag_weight]))
+        self.fragCELoss = torch.nn.CrossEntropyLoss(
+            weight=torch.tensor([1.0, frag_weight])
+        )
         self.MSELoss = torch.nn.MSELoss()
         self.lr = lr
-        self.lr_decay=lr_decay
+        self.lr_decay = lr_decay
         self.alpha = alpha
         self.tokenizer = tokenizer
+        self.return_embeddings = return_embeddings
+
+    @torch.no_grad()
+    def encode_spectra(
+        self, spectra: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Return encoder latents and padding mask without invoking the decoder.
+
+        Parameters
+        ----------
+        spectra : torch.Tensor
+            Input augmented spectra, shape (batch, n_peaks, features).
+
+        Returns
+        -------
+        memory : torch.Tensor
+            Encoder outputs of shape (batch, n_peaks + 1, d_model).
+        mem_mask : torch.Tensor
+            Boolean padding mask of shape (batch, n_peaks + 1); True where padded.
+        """
+        return self.spectrum_encoder(spectra)
+
+    @torch.no_grad()
+    def get_spectrum_embeddings(
+        self,
+        spectra: torch.Tensor,
+        pooling: str = "cls",
+    ) -> torch.Tensor:
+        """
+        Produce fixed-size spectrum embeddings from encoder outputs.
+
+        Parameters
+        ----------
+        spectra : torch.Tensor
+            Input augmented spectra, shape (batch, n_peaks, features).
+        pooling : str, optional
+            Pooling method: ``cls`` (latent spectrum token), ``mean`` (masked
+            mean over unpadded tokens), or ``max`` (masked max). Default is
+            ``cls``.
+
+        Returns
+        -------
+        torch.Tensor
+            Tensor of shape (batch, d_model) containing pooled embeddings.
+        """
+        memory, mem_mask = self.encode_spectra(spectra)
+
+        if pooling == "cls":
+            return memory[:, 0, :]
+
+        valid_mask = (~mem_mask).unsqueeze(-1)  # (batch, seq, 1)
+
+        if pooling == "mean":
+            summed = (memory * valid_mask).sum(dim=1)
+            counts = valid_mask.sum(dim=1).clamp(min=1)
+            return summed / counts
+
+        if pooling == "max":
+            masked = memory.masked_fill(mem_mask.unsqueeze(-1), float("-inf"))
+            values = masked.max(dim=1).values
+            values[~torch.isfinite(values)] = 0
+            return values
+
+        raise ValueError(f"Unknown pooling method: {pooling}")
 
     def _forward_step(
         self,
@@ -145,9 +215,9 @@ class AugmentedSpec2Pep(pl.LightningModule):
         sequences: List[str],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         emb = self.spectrum_encoder(spectra)
-        result =  self.decoder(sequences, precursors, *emb)
-        spec_rep = emb[0][:,0]
-        pred_prec = self.prec_layer(spec_rep)[:,0]
+        result = self.decoder(sequences, precursors, *emb)
+        spec_rep = emb[0][:, 0]
+        pred_prec = self.prec_layer(spec_rep)[:, 0]
         pred_frag = self.frag_layer(emb[0])
 
         return result, pred_prec, pred_frag
@@ -155,17 +225,19 @@ class AugmentedSpec2Pep(pl.LightningModule):
     def training_step(self, batch):
 
         spectra, precursors, sequences, frag_labels, _ = batch
-        preds, pred_prec, pred_frags= self._forward_step(spectra, precursors, sequences)
-        preds_seqs = torch.argmax(preds, dim=2)[:,:-1]
-        preds = preds[:,:-1,:].reshape(-1, len(self.tokenizer) + 1)
-        true_seqs = batch[2][:,:]
+        preds, pred_prec, pred_frags = self._forward_step(
+            spectra, precursors, sequences
+        )
+        preds_seqs = torch.argmax(preds, dim=2)[:, :-1]
+        preds = preds[:, :-1, :].reshape(-1, len(self.tokenizer) + 1)
+        true_seqs = batch[2][:, :]
 
-        loss = self.CELoss(preds,true_seqs.flatten())
+        loss = self.CELoss(preds, true_seqs.flatten())
 
-        true_prec = batch[1][:,0]/1000
+        true_prec = batch[1][:, 0] / 1000
         mse_loss = self.MSELoss(pred_prec, true_prec)
 
-        pred_frags = pred_frags[:,1:,:].reshape(-1, 2)
+        pred_frags = pred_frags[:, 1:, :].reshape(-1, 2)
         frag_loss = self.alpha * self.fragCELoss(pred_frags, frag_labels)
 
         correct_aas = torch.logical_or(preds_seqs == true_seqs, true_seqs == 0)
@@ -175,28 +247,13 @@ class AugmentedSpec2Pep(pl.LightningModule):
         pep_acc = torch.mean(correct_peps.float())
 
         frag_acc = torch.mean((torch.argmax(pred_frags, dim=1) == frag_labels).float())
-        frag_baseline = 1 - torch.sum(frag_labels)/len(frag_labels)
+        frag_baseline = 1 - torch.sum(frag_labels) / len(frag_labels)
 
-        self.log(
-            "Train CELoss",
-            loss.detach()
-        )
-        self.log(
-            "Train Frag Loss",
-            frag_loss.detach()
-        )
-        self.log(
-            "Train AA Acc.",
-            aa_acc.detach()
-        )
-        self.log(
-            "Train Pep. Acc.",
-            pep_acc.detach()
-        )
-        self.log(
-            "Train Frag Acc.",
-            frag_acc.detach()
-        )
+        self.log("Train CELoss", loss.detach())
+        self.log("Train Frag Loss", frag_loss.detach())
+        self.log("Train AA Acc.", aa_acc.detach())
+        self.log("Train Pep. Acc.", pep_acc.detach())
+        self.log("Train Frag Acc.", frag_acc.detach())
 
         return loss + frag_loss
 
@@ -204,16 +261,18 @@ class AugmentedSpec2Pep(pl.LightningModule):
         torch.set_grad_enabled(True)
 
         spectra, precursors, sequences, frag_labels, _ = batch
-        preds, pred_prec, pred_frags = self._forward_step(spectra, precursors, sequences)
-        preds_seqs = torch.argmax(preds, dim=2)[:,:-1]
-        preds = preds[:,:-1,:].reshape(-1, len(self.tokenizer) + 1)
-        true_seqs = batch[2][:,:]
-        loss = self.CELoss(preds,true_seqs.flatten())
+        preds, pred_prec, pred_frags = self._forward_step(
+            spectra, precursors, sequences
+        )
+        preds_seqs = torch.argmax(preds, dim=2)[:, :-1]
+        preds = preds[:, :-1, :].reshape(-1, len(self.tokenizer) + 1)
+        true_seqs = batch[2][:, :]
+        loss = self.CELoss(preds, true_seqs.flatten())
 
-        pred_frags = pred_frags[:,1:,:].reshape(-1, 2)
-        frag_loss = self.alpha*self.fragCELoss(pred_frags, frag_labels)
+        pred_frags = pred_frags[:, 1:, :].reshape(-1, 2)
+        frag_loss = self.alpha * self.fragCELoss(pred_frags, frag_labels)
         frag_acc = torch.mean((torch.argmax(pred_frags, dim=1) == frag_labels).float())
-        frag_baseline = 1 - torch.sum(frag_labels)/len(frag_labels)
+        frag_baseline = 1 - torch.sum(frag_labels) / len(frag_labels)
 
         correct_aas = torch.logical_or(preds_seqs == true_seqs, true_seqs == 0)
         padding = torch.sum(true_seqs == 0)
@@ -222,36 +281,11 @@ class AugmentedSpec2Pep(pl.LightningModule):
         correct_peps = torch.mean(correct_aas.float(), dim=1) == 1
         pep_acc = torch.mean(correct_peps.float())
 
-        self.log(
-            f"Val CELoss",
-            loss.detach(),
-            on_epoch=True,
-            sync_dist=True
-        )
-        self.log(
-            f"Val Frag Loss",
-            frag_loss.detach(),
-            on_epoch=True,
-            sync_dist=True
-        )
-        self.log(
-            f"Val AA Acc.",
-            aa_acc.detach(),
-            on_epoch=True,
-            sync_dist=True
-        )
-        self.log(
-            f"Val Pep. Acc.",
-            pep_acc.detach(),
-            on_epoch=True,
-            sync_dist=True
-        )
-        self.log(
-            f"Val Frag Acc.",
-            frag_acc.detach(),
-            on_epoch=True,
-            sync_dist=True
-        )
+        self.log(f"Val CELoss", loss.detach(), on_epoch=True, sync_dist=True)
+        self.log(f"Val Frag Loss", frag_loss.detach(), on_epoch=True, sync_dist=True)
+        self.log(f"Val AA Acc.", aa_acc.detach(), on_epoch=True, sync_dist=True)
+        self.log(f"Val Pep. Acc.", pep_acc.detach(), on_epoch=True, sync_dist=True)
+        self.log(f"Val Frag Acc.", frag_acc.detach(), on_epoch=True, sync_dist=True)
 
         return loss + frag_loss, pep_acc
 
@@ -261,16 +295,28 @@ class AugmentedSpec2Pep(pl.LightningModule):
         spectra, precursors, sequences, frag_labels, rts = batch
         device = spectra.get_device()
         if device < 0:
-            device = 'cpu'
+            device = "cpu"
 
-        cur_sequences = torch.empty((len(sequences),0), dtype=torch.int32, device=device)
-        aa_conf = torch.empty((len(sequences),0), dtype=torch.int32, device=device)
+        cur_sequences = torch.empty(
+            (len(sequences), 0), dtype=torch.int32, device=device
+        )
+        aa_conf = torch.empty((len(sequences), 0), dtype=torch.int32, device=device)
         for i in range(len(sequences[0]) + 1):
             preds, _, _ = self._forward_step(spectra, precursors, cur_sequences)
-            next_aa_scores = torch.softmax(preds[:,-1,:], 1)
+            next_aa_scores = torch.softmax(preds[:, -1, :], 1)
             next_aas = torch.argmax(next_aa_scores, 1)
-            aa_conf = torch.cat([aa_conf, torch.reshape(next_aa_scores[range(len(next_aas)),next_aas], (-1, 1))], dim=1)
-            cur_sequences = torch.cat([cur_sequences, torch.reshape(next_aas, (-1, 1))], dim=1)
+            aa_conf = torch.cat(
+                [
+                    aa_conf,
+                    torch.reshape(
+                        next_aa_scores[range(len(next_aas)), next_aas], (-1, 1)
+                    ),
+                ],
+                dim=1,
+            )
+            cur_sequences = torch.cat(
+                [cur_sequences, torch.reshape(next_aas, (-1, 1))], dim=1
+            )
 
         preds_seqs = cur_sequences
         true_seqs = batch[2]
@@ -281,9 +327,9 @@ class AugmentedSpec2Pep(pl.LightningModule):
         pep_conf = []
         trimmed_pred_seqs = []
         for pred_pep, pep_aa_conf in zip(pred_seqs, aa_conf):
-            trimmed_pep = pred_pep.split('$')[0]
+            trimmed_pep = pred_pep.split("$")[0]
             trimmed_pred_seqs.append(trimmed_pep)
-            pep_conf.append(torch.sum(torch.log(pep_aa_conf[:len(trimmed_pep) + 1])))
+            pep_conf.append(torch.sum(torch.log(pep_aa_conf[: len(trimmed_pep) + 1])))
 
         return trimmed_pred_seqs, true_seqs, pep_conf, aa_conf, rts, precursors
 
@@ -291,11 +337,11 @@ class AugmentedSpec2Pep(pl.LightningModule):
         """
         Initialize the optimizer.
         """
-        optimizer = torch.optim.Adam(self.parameters(), lr=self.lr, weight_decay = self.lr_decay)
-        # Apply learning rate scheduler per step.
-        lr_scheduler = CosineWarmupScheduler(
-            optimizer, warmup=10000, max_iters=100000
+        optimizer = torch.optim.Adam(
+            self.parameters(), lr=self.lr, weight_decay=self.lr_decay
         )
+        # Apply learning rate scheduler per step.
+        lr_scheduler = CosineWarmupScheduler(optimizer, warmup=10000, max_iters=100000)
         return [optimizer], {"scheduler": lr_scheduler, "interval": "step"}
 
 
@@ -313,9 +359,7 @@ class CosineWarmupScheduler(torch.optim.lr_scheduler._LRScheduler):
         The total number of iterations.
     """
 
-    def __init__(
-        self, optimizer: torch.optim.Optimizer, warmup: int, max_iters: int
-    ):
+    def __init__(self, optimizer: torch.optim.Optimizer, warmup: int, max_iters: int):
         self.warmup, self.max_iters = warmup, max_iters
         super().__init__(optimizer)
 

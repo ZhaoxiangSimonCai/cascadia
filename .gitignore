@@ -1,0 +1,15 @@
+**/__pycache__/
+**/lightning_logs/
+**/models/
+**/data/
+**/docs/build/
+**/docs/source/_build/
+**/docs/source/_static/
+**/docs/source/_templates/
+**/docs/source/_static/
+**/*.pyc
+
+cascadia.egg-info/
+
+**/*.hdf5
+**/*.asf
