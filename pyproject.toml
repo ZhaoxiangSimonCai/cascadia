@@ -31,10 +31,12 @@ dependencies = [
     "pillow>=9.4.0",
     "spectrum-utils>=0.4.1",
     "tensorboard",
+    "joblib>=1.2.0",
 ]
 
 [project.scripts]
 cascadia = "cascadia.cascadia:main"
+cascadia-parallel = "cascadia.parallel:main"
 
 [project.urls]
 Homepage = "https://github.com/Noble-Lab/cascadia"

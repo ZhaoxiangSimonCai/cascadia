@@ -79,7 +79,10 @@ def process_single_file(
     os.mkdir(temp_path)
     train_index_filename = temp_path + "/index.hdf5"
 
-    print("Augmenting spectra from:", spectrum_file)
+    print(
+        f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Augmenting spectra from:",
+        spectrum_file,
+    )
     asf_file, isolation_window_size, cycle_time = augment_spectra(
         str(spectrum_file), temp_path, max_charge=max_charge
     )
@@ -176,7 +179,7 @@ def process_single_file(
                 f.attrs["pooling_method"] = "cls"
                 f.attrs["model_type"] = "Cascadia"
             print(
-                f"Saved spectrum-level embeddings to: {output_path} with shape {embeddings.shape}"
+                f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Saved spectrum-level embeddings to: {output_path} with shape {embeddings.shape}"
             )
 
     os.remove(train_index_filename)
